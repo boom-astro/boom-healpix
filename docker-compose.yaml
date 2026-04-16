@@ -1,0 +1,54 @@
+# MongoDB instances for benchmarking and sharding demos.
+#
+# Single instance (benchmarks):
+#   docker compose up mongo -d
+#   cargo run --release --bin benchmark -- --help
+#
+# Two instances (sharding demo):
+#   docker compose up mongo-shard-0 mongo-shard-1 -d
+#   cargo run --release --bin sharding-demo -- --help
+
+services:
+  # Single instance for query benchmarks
+  mongo:
+    image: mongo:7.0
+    ports:
+      - "27099:27017"
+    volumes:
+      - mongo-data:/data/db
+    command: ["mongod", "--wiredTigerCacheSizeGB", "2"]
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  # Machine 0: holds base cells 0–5 (one half of the sky)
+  mongo-shard-0:
+    image: mongo:7.0
+    ports:
+      - "27081:27017"
+    volumes:
+      - shard0-data:/data/db
+    command: ["mongod", "--wiredTigerCacheSizeGB", "1"]
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # Machine 1: holds base cells 6–11 (other half of the sky)
+  mongo-shard-1:
+    image: mongo:7.0
+    ports:
+      - "27082:27017"
+    volumes:
+      - shard1-data:/data/db
+    command: ["mongod", "--wiredTigerCacheSizeGB", "1"]
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+volumes:
+  mongo-data:
+  shard0-data:
+  shard1-data:

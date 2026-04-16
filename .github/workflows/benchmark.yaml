@@ -1,0 +1,99 @@
+name: HEALPix Benchmark & Sharding Demo
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Query Benchmark (HEALPix vs 2dsphere)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      mongo:
+        image: mongo:7.0
+        ports:
+          - 27099:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping:1})' --quiet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmark (1M catalog, 500 queries/radius)
+        run: |
+          cargo run --release --bin benchmark -- \
+            --mongo-uri mongodb://localhost:27099 \
+            --catalog-size 1000000 \
+            --n-queries 500
+
+      - name: Run benchmark with explain (100K, quick)
+        run: |
+          cargo run --release --bin benchmark -- \
+            --mongo-uri mongodb://localhost:27099 \
+            --catalog-size 100000 \
+            --n-queries 100 \
+            --explain
+
+  sharding-demo:
+    name: Sharding Demo (2 machines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start two MongoDB instances
+        run: |
+          docker run -d --name mongo-shard-0 -p 27081:27017 mongo:7.0
+          docker run -d --name mongo-shard-1 -p 27082:27017 mongo:7.0
+
+          echo "Waiting for both instances..."
+          for i in $(seq 1 30); do
+            if docker exec mongo-shard-0 mongosh --quiet --eval "db.runCommand({ping:1})" >/dev/null 2>&1 && \
+               docker exec mongo-shard-1 mongosh --quiet --eval "db.runCommand({ping:1})" >/dev/null 2>&1; then
+              echo "Both instances ready!"
+              break
+            fi
+            echo "Attempt $i/30..."
+            sleep 2
+          done
+
+      - name: "Demo: 10\" cone search (typical cross-match)"
+        run: |
+          cargo run --release --bin sharding-demo -- \
+            --n-alerts 100000 \
+            --n-queries 500 \
+            --radius-arcsec 10
+
+      - name: "Demo: 60\" cone search (larger radius)"
+        run: |
+          cargo run --release --bin sharding-demo -- \
+            --n-alerts 100000 \
+            --n-queries 500 \
+            --radius-arcsec 60
+
+      - name: "Demo: 300\" cone search (NED-scale)"
+        run: |
+          cargo run --release --bin sharding-demo -- \
+            --n-alerts 100000 \
+            --n-queries 200 \
+            --radius-arcsec 300
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop mongo-shard-0 mongo-shard-1 || true
+          docker rm mongo-shard-0 mongo-shard-1 || true
