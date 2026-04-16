@@ -55,6 +55,10 @@ struct Args {
     /// HEALPix depth for $in queries (default: 16, like extcats)
     #[arg(long, default_value_t = DEFAULT_IN_DEPTH)]
     in_depth: u8,
+
+    /// Write results to JSON file (for plotting)
+    #[arg(long)]
+    output_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -464,17 +468,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", idx_tbl);
     }
 
-    // --- Generate query positions ---
-    let mut positions: Vec<(f64, f64)> = Vec::with_capacity(args.n_queries);
-    for _ in 0..args.n_queries {
-        let ra: f64 = rng.random::<f64>() * 360.0;
-        let u: f64 = rng.random::<f64>();
-        let dec: f64 = (2.0 * u - 1.0_f64).asin().to_degrees();
-        positions.push((ra, dec));
+    // --- Benchmark ---
+    // NOTE: Fresh random positions are generated for EACH method at each radius
+    // to avoid MongoDB cache warming from one method benefiting the next.
+    let radii = vec![2.0, 5.0, 10.0, 30.0, 60.0, 300.0];
+
+    /// Generate fresh random sky positions (uniform on sphere).
+    fn random_positions(rng: &mut impl Rng, n: usize) -> Vec<(f64, f64)> {
+        (0..n).map(|_| {
+            let ra: f64 = rng.random::<f64>() * 360.0;
+            let u: f64 = rng.random::<f64>();
+            let dec: f64 = (2.0 * u - 1.0_f64).asin().to_degrees();
+            (ra, dec)
+        }).collect()
     }
 
-    // --- Benchmark ---
-    let radii = vec![2.0, 5.0, 10.0, 30.0, 60.0, 300.0];
+    // Collect structured results for JSON output
+    #[derive(serde::Serialize)]
+    struct QueryResult {
+        radius_arcsec: f64,
+        method: String,
+        time_secs: f64,
+        raw_hits: usize,
+        exact_hits: usize,
+    }
+    let mut json_queries: Vec<QueryResult> = Vec::new();
+
+    // Capture index sizes for JSON
+    let mut idx_size_2ds: i64 = 0;
+    let mut idx_size_hpx29: i64 = 0;
+    let mut idx_size_hpx16: i64 = 0;
+    {
+        let stats2: Vec<_> = coll.aggregate(vec![doc! { "$collStats": { "storageStats": {} } }]).await?.collect::<Vec<_>>().await;
+        if let Some(Ok(sd)) = stats2.first() {
+            if let Ok(s) = sd.get_document("storageStats") {
+                if let Ok(isz) = s.get_document("indexSizes") {
+                    idx_size_2ds = bson_to_i64(isz.get("loc_2dsphere"));
+                    idx_size_hpx29 = bson_to_i64(isz.get("hpx_1"));
+                    idx_size_hpx16 = bson_to_i64(isz.get(&format!("hpx_{}_1", args.in_depth)));
+                }
+            }
+        }
+    }
 
     let mut tbl = Table::new();
     tbl.set_header(vec![
@@ -488,26 +523,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let radius_rad = (*radius_arcsec / 3600.0_f64).to_radians();
         let range_depth = auto_query_depth(radius_rad);
 
-        // Explain
+        // Explain (uses a single sample position)
         if args.explain {
+            let sample = random_positions(&mut rng, 1);
             println!("--- {}\" ---", radius_arcsec);
-            let geo_f = geojson_filter(positions[0].0, positions[0].1, radius_rad);
+            let geo_f = geojson_filter(sample[0].0, sample[0].1, radius_rad);
             explain_query(&db, coll_name, &geo_f, "2dsphere").await?;
-            let (range_f, _) = hpx_range_filter(positions[0].0, positions[0].1, radius_rad, range_depth);
+            let (range_f, _) = hpx_range_filter(sample[0].0, sample[0].1, radius_rad, range_depth);
             explain_query(&db, coll_name, &range_f, "HPX ranges").await?;
-            let (in_f, _) = hpx_in_filter(positions[0].0, positions[0].1, radius_rad, args.in_depth);
+            let (in_f, _) = hpx_in_filter(sample[0].0, sample[0].1, radius_rad, args.in_depth);
             explain_query(&db, coll_name, &in_f, "HPX $in").await?;
             println!();
         }
 
+        // Fresh random positions per method to avoid cache warming bias.
+        // Each method gets its own set so the first method can't warm
+        // MongoDB's WiredTiger page cache for the second.
+        let pos_geo = random_positions(&mut rng, args.n_queries);
+        let pos_ranges = random_positions(&mut rng, args.n_queries);
+        let pos_in = random_positions(&mut rng, args.n_queries);
+
         // 2dsphere
-        let geo = bench_geojson(&coll, &positions, *radius_arcsec).await?;
+        let geo = bench_geojson(&coll, &pos_geo, *radius_arcsec).await?;
 
         // HEALPix ranges
-        let (ranges, n_ranges) = bench_hpx_ranges(&coll, &positions, *radius_arcsec, range_depth).await?;
+        let (ranges, n_ranges) = bench_hpx_ranges(&coll, &pos_ranges, *radius_arcsec, range_depth).await?;
 
         // HEALPix $in
-        let (in_result, n_pixels) = bench_hpx_in(&coll, &positions, *radius_arcsec, args.in_depth).await?;
+        let (in_result, n_pixels) = bench_hpx_in(&coll, &pos_in, *radius_arcsec, args.in_depth).await?;
 
         let radius_label = format!("{}\"", radius_arcsec);
 
@@ -559,13 +602,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Cell::new(&in_overincl),
         ]);
 
-        // Verify exact hits match across methods
-        if geo.exact_hits != ranges.exact_hits || geo.exact_hits != in_result.exact_hits {
-            eprintln!(
-                "  WARNING at {}\" — exact hits differ: 2ds={} ranges={} $in={}",
-                radius_arcsec, geo.exact_hits, ranges.exact_hits, in_result.exact_hits
-            );
-        }
+        // Record for JSON
+        json_queries.push(QueryResult { radius_arcsec: *radius_arcsec, method: "2dsphere".into(), time_secs: geo.total_time.as_secs_f64(), raw_hits: geo.raw_hits, exact_hits: geo.exact_hits });
+        json_queries.push(QueryResult { radius_arcsec: *radius_arcsec, method: "hpx_ranges".into(), time_secs: ranges.total_time.as_secs_f64(), raw_hits: ranges.raw_hits, exact_hits: ranges.exact_hits });
+        json_queries.push(QueryResult { radius_arcsec: *radius_arcsec, method: "hpx_in".into(), time_secs: in_result.total_time.as_secs_f64(), raw_hits: in_result.raw_hits, exact_hits: in_result.exact_hits });
+
+        // Note: exact hits differ across methods because each uses fresh random
+        // positions (to avoid cache warming bias). This is expected behavior.
     }
 
     println!("{}", tbl);
@@ -603,6 +646,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!("{}", idx_tbl);
+    }
+
+    // --- Write JSON ---
+    if let Some(ref path) = args.output_json {
+        #[derive(serde::Serialize)]
+        struct BenchOutput {
+            catalog_size: usize,
+            n_queries: usize,
+            index_build_secs: std::collections::HashMap<String, f64>,
+            index_size_bytes: std::collections::HashMap<String, i64>,
+            queries: Vec<QueryResult>,
+        }
+        let mut build_times = std::collections::HashMap::new();
+        build_times.insert("2dsphere".into(), geo_t.as_secs_f64());
+        build_times.insert("hpx_29".into(), hpx_t.as_secs_f64());
+        build_times.insert(format!("hpx_{}", args.in_depth), in_t.as_secs_f64());
+
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert("2dsphere".into(), idx_size_2ds);
+        sizes.insert("hpx_29".into(), idx_size_hpx29);
+        sizes.insert(format!("hpx_{}", args.in_depth), idx_size_hpx16);
+
+        let output = BenchOutput {
+            catalog_size: args.catalog_size,
+            n_queries: args.n_queries,
+            index_build_secs: build_times,
+            index_size_bytes: sizes,
+            queries: json_queries,
+        };
+        let json = serde_json::to_string_pretty(&output)?;
+        std::fs::write(path, &json)?;
+        println!("\nResults written to {}", path);
     }
 
     if !args.keep {

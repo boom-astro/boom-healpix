@@ -1,0 +1,103 @@
+# MongoDB sharded cluster: 2 shards + config server + mongos router.
+#
+# This is the "let MongoDB handle it" approach. The mongos router
+# decides which shard to send each query to based on the shard key.
+#
+# Usage:
+#   docker compose -f docker-compose.sharded.yaml up -d
+#   docker compose -f docker-compose.sharded.yaml exec mongos mongosh --eval "..."
+#   cargo run --release --bin sharded-cluster -- --help
+#   docker compose -f docker-compose.sharded.yaml down -v
+
+services:
+  # Config server (stores metadata about chunk→shard mapping)
+  configsvr:
+    image: mongo:7.0
+    command: mongod --configsvr --replSet configrs --port 27017
+    volumes:
+      - configsvr-data:/data/db
+
+  # Shard 0 (single-node replica set)
+  shard0:
+    image: mongo:7.0
+    command: mongod --shardsvr --replSet shard0rs --port 27017
+    ports:
+      - "27091:27017"
+    volumes:
+      - shard0-data:/data/db
+
+  # Shard 1 (single-node replica set)
+  shard1:
+    image: mongo:7.0
+    command: mongod --shardsvr --replSet shard1rs --port 27017
+    ports:
+      - "27092:27017"
+    volumes:
+      - shard1-data:/data/db
+
+  # Mongos router (application connects here)
+  mongos:
+    image: mongo:7.0
+    command: mongos --configdb configrs/configsvr:27017 --port 27017 --bind_ip_all
+    ports:
+      - "27100:27017"
+    depends_on:
+      - configsvr
+      - shard0
+      - shard1
+
+  # Benchmark runner (runs inside Docker network so it can resolve shard hostnames)
+  bench:
+    build: .
+    depends_on:
+      - init
+    entrypoint: ["./sharded-cluster"]
+    command: ["--mongos-uri", "mongodb://mongos:27017", "--catalog-size", "200000", "--n-queries", "300"]
+    profiles: ["bench"]
+
+  # Init container: sets up replica sets, adds shards to cluster
+  init:
+    image: mongo:7.0
+    depends_on:
+      - configsvr
+      - shard0
+      - shard1
+      - mongos
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        echo "Waiting for all nodes to start..."
+        sleep 10
+
+        echo "Initializing config server replica set..."
+        mongosh --host configsvr --eval '
+          rs.initiate({ _id: "configrs", configsvr: true, members: [{ _id: 0, host: "configsvr:27017" }] })
+        '
+        sleep 5
+
+        echo "Initializing shard0 replica set..."
+        mongosh --host shard0 --eval '
+          rs.initiate({ _id: "shard0rs", members: [{ _id: 0, host: "shard0:27017" }] })
+        '
+        sleep 3
+
+        echo "Initializing shard1 replica set..."
+        mongosh --host shard1 --eval '
+          rs.initiate({ _id: "shard1rs", members: [{ _id: 0, host: "shard1:27017" }] })
+        '
+        sleep 3
+
+        echo "Adding shards to cluster via mongos..."
+        mongosh --host mongos --eval '
+          sh.addShard("shard0rs/shard0:27017");
+          sh.addShard("shard1rs/shard1:27017");
+          sh.status();
+        '
+
+        echo "Sharded cluster ready!"
+
+volumes:
+  configsvr-data:
+  shard0-data:
+  shard1-data:

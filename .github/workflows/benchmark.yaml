@@ -45,6 +45,53 @@ jobs:
             --n-queries 100 \
             --explain
 
+  scaling:
+    name: Scaling Comparison & Plots
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      mongo:
+        image: mongo:7.0
+        ports:
+          - 27099:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping:1})' --quiet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install matplotlib numpy
+
+      - name: Run benchmarks at multiple catalog sizes
+        run: |
+          for n in 100000 500000 1000000 2000000; do
+            echo "=== Catalog size: $n ==="
+            cargo run --release --bin benchmark -- \
+              --mongo-uri mongodb://localhost:27099 \
+              --catalog-size $n \
+              --n-queries 500 \
+              --output-json results_${n}.json
+          done
+
+      - name: Generate plots
+        run: python plot.py results_*.json
+
+      - name: Upload plots
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-plots
+          path: |
+            *.png
+            results_*.json
+
   sharding-demo:
     name: Sharding Demo (2 machines)
     runs-on: ubuntu-latest
